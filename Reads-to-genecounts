@@ -1,0 +1,136 @@
+#!/bin/bash
+#-----------------------------------------------------------------
+# Pipeline from fastq to gene-counts
+#-----------------------------------------------------------------
+
+#SBATCH -J DEG                 	# Job name
+#SBATCH -o log.DEG.%j.out 	# Specify stdout output file
+#SBATCH -n 1                    # Total number of tasks
+#SBATCH -p "htc-el8"            # partition
+#SBATCH --mem=400GB             # Memory
+#SBATCH -t 200:00:00            # Run time (hh:mm:ss)
+#SBATCH -c 32                   # Cores
+#SBATCH -A huber                # Specify allocation
+#----------------------------------------------------------------
+
+# Load all necessary modules
+module purge
+module load FastQC/0.11.9-Java-11
+module load MultiQC/1.12-foss-2021b
+module load Trimmomatic/0.39-Java-1.8.0_112
+module load SAMtools/1.16.1-GCC-11.3.0
+module load Subread/2.0.3-GCC-11.2.0
+
+# Environment:
+
+#### ADJUST: input folders & files AND input modifications in STEP 2
+
+# needed in input_dir: genome assembly, genome annotation, reads, adapter file for trimming
+# adjust folders and files
+input_dir="/scratch/hartke/dev_RNApipeline/Input"
+trim_dir="/scratch/hartke/dev_RNApipeline/Trim"
+map_dir="/scratch/hartke/dev_RNApipeline/Map"
+gc_dir="/scratch/hartke/dev_RNApipeline/genecounts"
+GENOME=$input_dir/VectorBase-64_AgambiaePEST_Genome.fasta
+SPLICE=$input_dir/VectorBase-64_AgambiaePEST.ss # for hisat index
+EXON=$input_dir/VectorBase-64_AgambiaePEST.exon # for hisat index
+ANNOTATION="/scratch/hartke/dev_RNApipeline/Input/VectorBase-64_AgambiaePEST.gff"
+PROJECT="NG-34024"
+
+# STEP 1
+echo -e "#########\n## STEP 1: QUALITY CHECK\n#########"
+
+mkdir "$trim_dir"
+
+ srun fastqc $input_dir/*.fastq.gz
+ srun multiqc $input_dir -o multiqc_beforetrim
+
+# STEP 2
+echo -e "#########\n## STEP 2: TRIMMING\n#########"
+
+# specify input for trimming and shorten names of files
+ for f1 in $input_dir/*_1.fastq.gz  # adjust depending on file ending
+        do
+        f2=${f1%%_1.fastq.gz}"_2".fastq.gz
+        f1="${f1##*/}"
+        f2="${f2##*/}"
+        namef="${f1/.fastq.gz}"
+        namer="${f2/.fastq.gz}"
+
+echo -e "\nINPUT FILES:"
+echo "$f1"
+echo "$f2"
+
+echo -e "\nSHORT NAMES:"
+echo "$namef"
+echo "$namer"
+
+# run trimmomatic
+  srun java -jar $EBROOTTRIMMOMATIC/trimmomatic-0.39.jar \
+        PE -threads $SLURM_CPUS_ON_NODE \
+        -phred33 $input_dir/$f1 $input_dir/$f2 $trim_dir/"$namef".paired.fq $trim_dir/"$namef".unpaired.fq \
+        $trim_dir/"$namer".paired.fq $trim_dir/"$namer".unpaired.fq \
+        ILLUMINACLIP:$input_dir/TruSeq3-PE.fa:2:30:10 \
+        LEADING:3 TRAILING:3 \
+        SLIDINGWINDOW:4:15 MINLEN:120 TOPHRED33
+  done
+
+# STEP 3
+echo -e "#########\n## STEP 3: QUALITY CHECK AFTER TRIM\n#########"
+
+# run fastqc again on trimmed reads
+  srun fastqc $trim_dir/*.paired.fq
+  srun multiqc $trim_dir -o multiqc_aftertrim
+
+
+# delete unpaired files
+ rm $trim_dir/*.unpaired.fq
+
+# gzip files
+ gzip $trim_dir/*.fq
+
+# create output folder
+ mkdir $map_dir
+
+
+module load Boost.Python/1.81.0-GCC-12.2.0 # needed by hisat2
+
+# STEP 4
+echo -e "#########\n## STEP 4: MAPPING\n#########"
+
+# run Hisat2
+ hisat2-build -p 20 --ss $SPLICE --exon $EXON $GENOME $GENOME
+
+ for reads1 in $trim_dir/*_1.paired.fq.gz
+        do
+        reads2=${reads1%%_1.paired.fq.gz}"_2".paired.fq.gz
+        name="${reads1##*/}"
+        name="${name/.paired.fq.gz/}"
+        srun hisat2 -p $SLURM_CPUS_ON_NODE \
+        --dta -x $GENOME -1 $reads1 -2 $reads2 \
+        --summary-file $map_dir/"$name".hisat.stats.txt|\
+        samtools view -b - |\
+        samtools sort - \
+        > $map_dir/"$name".hisat.sort.bam
+ done
+
+# STEP 5
+echo -e "#########\n## STEP 5: GENE COUNTS\n#########"
+
+# create gene count matrix with featureCounts
+
+ mkdir $gc_dir
+
+ srun featureCounts -a $ANNOTATION -o $gc_dir/"$PROJECT".featureCounts.txt \
+        -T $SLURM_CPUS_ON_NODE -p $map_dir/*.sort.bam
+
+# FINISH
+
+# delete all junk:
+rm $input_dir/*_fastqc.zip
+rm $input_dir/*_fastqc.html
+rm $trim_dir/*_fastqc.zip
+rm $trim_dir/*_fastqc.html
+
+echo "output stats and gene counts table are in genecounts/ reports on read quality are in the multiqc folders"
+
